@@ -61,11 +61,19 @@ SMOKE_PROBLEMS = [
 class SchmittEntropyGate:
     """Auto-calibrated entropy gate from the paper.
 
-    During the first ``warmup_steps`` (lambda = 0) it records the median teacher
-    entropy H per step and sets H_warm = median of those. Afterwards the gate
+    During the first ``warmup_steps`` (lambda = 0) it records the teacher entropy
+    statistic H per step and sets H_warm = median of those. Afterwards the gate
     closes when H < tau_down = 0.93 * H_warm and only reopens once H >= H_warm,
     which stops it chattering when entropy hovers near the threshold.
+
+    Degenerate case: if H_warm is already ~0 (Gemma 4 E2B's median per-token
+    teacher entropy is below 1e-3 nats) there is no "collapse" left to detect
+    and the thresholds would sit inside floating-point noise. The gate is then
+    declared inert and stays open, which is the behaviour the paper's gate has
+    on any model whose entropy never drops below its warmup level.
     """
+
+    MIN_H_WARM = 1e-3  # nats
 
     def __init__(self, warmup_steps: int, down_factor: float = 0.93):
         self.warmup_steps = warmup_steps
@@ -74,15 +82,24 @@ class SchmittEntropyGate:
         self.h_warm: Optional[float] = None
         self.tau_down: Optional[float] = None
         self.is_open = True
+        self.inert = False
 
     def update(self, step: int, teacher_entropy: float) -> Dict[str, object]:
+        teacher_entropy = max(0.0, float(teacher_entropy))  # entropy is >= 0; kill fp noise
         if step < self.warmup_steps:
             self.warmup_entropies.append(teacher_entropy)
             return {"gate": "calibrating", "gate_open": False}
         if self.h_warm is None:
             self.h_warm = statistics.median(self.warmup_entropies) if self.warmup_entropies else teacher_entropy
             self.tau_down = self.down_factor * self.h_warm
-            print(f"[gate] calibrated: H_warm={self.h_warm:.4g}  tau_down={self.tau_down:.4g}")
+            if self.h_warm < self.MIN_H_WARM:
+                self.inert = True
+                print(f"[gate] calibrated: H_warm={self.h_warm:.3g} < {self.MIN_H_WARM:g} nats -> "
+                      f"gate is INERT (teacher entropy already ~0; AntiSD stays on)")
+            else:
+                print(f"[gate] calibrated: H_warm={self.h_warm:.4g}  tau_down={self.tau_down:.4g}")
+        if self.inert:
+            return {"gate": "inert", "gate_open": True}
         if self.is_open and teacher_entropy < self.tau_down:
             self.is_open = False
         elif not self.is_open and teacher_entropy >= self.h_warm:
