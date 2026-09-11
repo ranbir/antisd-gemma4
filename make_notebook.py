@@ -53,8 +53,10 @@ else:
 print("4-bit flag:", repr(FOURBIT))
 """),
     code("""
-# 2. Dependencies (Gemma 4 needs a current transformers)
+# 2. Dependencies (Gemma 4 needs a current transformers).
+#    Colab preinstalls an old torchao that current PEFT refuses to coexist with; remove it.
 !pip install -q -U transformers peft datasets accelerate bitsandbytes
+!pip uninstall -q -y torchao 2>/dev/null || true
 """),
     code("""
 # 3. (Optional) Hugging Face login. Gemma 4 E2B is ungated Apache 2.0, so this is only needed
