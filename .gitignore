@@ -25,3 +25,4 @@ Thumbs.db
 *.md
 !README.md
 !**/README.md
+.gstack/

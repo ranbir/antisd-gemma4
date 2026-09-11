@@ -72,6 +72,7 @@ import os
 if not os.path.exists("antisd-gemma4"):
     !git clone {REPO_URL}
 %cd antisd-gemma4
+!git pull -q
 !ls
 """),
     code("""
@@ -82,10 +83,11 @@ LAMBDA = 0.5        # AntiSD weight (paper default)
 MAX_NEW = 1024      # generation budget for thinking + answer
 N_EVAL = 100        # held-out GSM8K test problems (200 in the blog; lower it for a quick pass)
 SEED = 0
+EVAL_BS = 4 if FOURBIT else 16   # problems generated at once during evaluation
 """),
     code("""
 # 6. Evaluate the untouched base model
-!python eval_antisd.py --n {N_EVAL} --max_new_tokens {MAX_NEW} {FOURBIT} --out outputs/eval_base.json
+!python eval_antisd.py --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/eval_base.json
 """),
     code("""
 # 7. GRPO baseline: identical pipeline, AntiSD term switched off
@@ -99,8 +101,8 @@ SEED = 0
 """),
     code("""
 # 9. Evaluate both adapters on the same held-out problems
-!python eval_antisd.py --adapter_dir outputs/grpo   --n {N_EVAL} --max_new_tokens {MAX_NEW} {FOURBIT} --out outputs/eval_grpo.json
-!python eval_antisd.py --adapter_dir outputs/antisd --n {N_EVAL} --max_new_tokens {MAX_NEW} {FOURBIT} --out outputs/eval_antisd.json
+!python eval_antisd.py --adapter_dir outputs/grpo   --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/eval_grpo.json
+!python eval_antisd.py --adapter_dir outputs/antisd --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/eval_antisd.json
 """),
     code("""
 # 10. Results table (this is what goes into the blog post)

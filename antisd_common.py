@@ -418,3 +418,37 @@ def sample_rollouts(model, tokenizer, prompt_ids: Sequence[int], n: int, max_new
     out = model.generate(**gen_kwargs)
     p_len = ids.shape[1]
     return [trim_generation(row[p_len:].tolist(), stops, pad_id) for row in out]
+
+
+@torch.no_grad()
+def sample_rollouts_batched(model, tokenizer, prompts_ids: Sequence[Sequence[int]], n: int,
+                            max_new_tokens: int, device: torch.device, temperature: float = 1.0,
+                            top_p: float = 0.95, top_k: int = 64, greedy: bool = False
+                            ) -> List[List[List[int]]]:
+    """Generate for several prompts at once (left-padded). Returns, per prompt, ``n`` trimmed rollouts.
+
+    Used by evaluation, where prompts differ. Left padding keeps every prompt's
+    last token adjacent to the first generated token, and the attention mask
+    tells the model to ignore the pads.
+    """
+    stops = terminator_ids(tokenizer, model)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (stops[0] if stops else 0)
+    max_len = max(len(p) for p in prompts_ids)
+    ids = torch.full((len(prompts_ids), max_len), pad_id, dtype=torch.long)
+    attn = torch.zeros_like(ids)
+    for i, p in enumerate(prompts_ids):
+        ids[i, max_len - len(p):] = torch.tensor(list(p), dtype=torch.long)
+        attn[i, max_len - len(p):] = 1
+    ids, attn = ids.to(device), attn.to(device)
+    gen_kwargs = dict(
+        input_ids=ids, attention_mask=attn, max_new_tokens=max_new_tokens,
+        num_return_sequences=n, pad_token_id=pad_id, eos_token_id=stops if stops else None,
+        use_cache=True,
+    )
+    if greedy:
+        gen_kwargs.update(do_sample=False)
+    else:
+        gen_kwargs.update(do_sample=True, temperature=temperature, top_p=top_p, top_k=top_k)
+    out = model.generate(**gen_kwargs)  # rows are grouped by prompt: [p0s0, p0s1, ..., p1s0, ...]
+    gens = [trim_generation(row[max_len:].tolist(), stops, pad_id) for row in out]
+    return [gens[i * n:(i + 1) * n] for i in range(len(prompts_ids))]

@@ -31,7 +31,7 @@ from antisd_common import (
     load_model_and_tokenizer,
     pick_device,
     render_prompt,
-    sample_rollouts,
+    sample_rollouts_batched,
     split_thought_and_answer,
     terminator_ids,
 )
@@ -52,6 +52,7 @@ def main() -> None:
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--top_k", type=int, default=64)
     p.add_argument("--max_new_tokens", type=int, default=1024)
+    p.add_argument("--batch_size", type=int, default=16, help="problems generated at once (A100: 16-32, T4 4-bit: 4)")
     p.add_argument("--load_in_4bit", action="store_true")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--out", default="outputs/eval.json")
@@ -70,30 +71,34 @@ def main() -> None:
 
     records: List[dict] = []
     t0 = time.time()
-    for idx, row in enumerate(ds):
-        problem, gold = row["question"], row["answer"]
-        prompt_ids = encode_prompt(tokenizer, render_prompt(tokenizer, problem))
-        gens = sample_rollouts(model, tokenizer, prompt_ids, args.k, args.max_new_tokens, device,
-                               temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
-                               greedy=greedy)
-        for j, g in enumerate(gens):
-            completion = tokenizer.decode([t for t in g if t not in stop_ids], skip_special_tokens=False)
-            thought, answer = split_thought_and_answer(completion)
-            correct = compute_verifiable_reward(completion, gold)
-            records.append({
-                "idx": idx, "sample": j, "problem": problem, "gold": gold,
-                "gold_number": extract_answer_number(gold),
-                "pred_number": extract_answer_number(answer if answer else completion),
-                "correct": correct,
-                "gen_tokens": len(g),
-                "thought_tokens": len(tokenizer(thought, add_special_tokens=False).input_ids) if thought else 0,
-                "deliberation_markers": count_deliberation_markers(thought),
-                "finished": bool(g) and g[-1] in stop_ids,
-                "completion": completion,
-            })
-        if (idx + 1) % 10 == 0:
-            acc = sum(r["correct"] for r in records) / len(records)
-            print(f"[{idx+1}/{len(ds)}] running acc={acc:.3f}  ({(time.time()-t0)/60:.1f} min)")
+    rows = list(ds)
+    for start in range(0, len(rows), args.batch_size):
+        chunk = rows[start:start + args.batch_size]
+        prompts = [encode_prompt(tokenizer, render_prompt(tokenizer, r["question"])) for r in chunk]
+        per_prompt = sample_rollouts_batched(model, tokenizer, prompts, args.k, args.max_new_tokens, device,
+                                             temperature=args.temperature, top_p=args.top_p,
+                                             top_k=args.top_k, greedy=greedy)
+        for offset, (row, gens) in enumerate(zip(chunk, per_prompt)):
+            idx = start + offset
+            problem, gold = row["question"], row["answer"]
+            for j, g in enumerate(gens):
+                completion = tokenizer.decode([t for t in g if t not in stop_ids], skip_special_tokens=False)
+                thought, answer = split_thought_and_answer(completion)
+                correct = compute_verifiable_reward(completion, gold)
+                records.append({
+                    "idx": idx, "sample": j, "problem": problem, "gold": gold,
+                    "gold_number": extract_answer_number(gold),
+                    "pred_number": extract_answer_number(answer if answer else completion),
+                    "correct": correct,
+                    "gen_tokens": len(g),
+                    "thought_tokens": len(tokenizer(thought, add_special_tokens=False).input_ids) if thought else 0,
+                    "deliberation_markers": count_deliberation_markers(thought),
+                    "finished": bool(g) and g[-1] in stop_ids,
+                    "completion": completion,
+                })
+        done = min(start + args.batch_size, len(rows))
+        acc = sum(r["correct"] for r in records) / len(records)
+        print(f"[{done}/{len(rows)}] running acc={acc:.3f}  ({(time.time()-t0)/60:.1f} min)")
 
     n = len(records)
     summary = {
