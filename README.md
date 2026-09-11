@@ -22,12 +22,12 @@ that already knows the answer dislikes hesitation ("wait", "let me check"), so p
 self-distillation trains it away. AntiSD flips the sign and bounds it:
 
 $$
-A_t^{\text{AntiSD}} = -\tfrac{1}{2}\big(\operatorname{softplus}(u_t) - \log 2\big)
+A_t^{\text{AntiSD}} = -\tfrac{1}{2}\left(\mathrm{softplus}(u_t) - \log 2\right)
 $$
 
-Deliberation tokens ($u_t \ll 0$) get a bonus capped at $+\tfrac12\log 2$; shortcut tokens
+Deliberation tokens ($u_t \ll 0$) get a bonus capped at $+\tfrac{1}{2}\log 2$; shortcut tokens
 ($u_t \gg 0$) get a linear penalty. An entropy gate (Schmitt trigger at
-$0.93\,H_{\text{warm}}$) switches the term off if the teacher's entropy collapses.
+$0.93 H_{\text{warm}}$) switches the term off if the teacher's entropy collapses.
 
 ## Files
 
