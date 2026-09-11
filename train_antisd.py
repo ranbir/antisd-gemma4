@@ -82,7 +82,7 @@ class SchmittEntropyGate:
         if self.h_warm is None:
             self.h_warm = statistics.median(self.warmup_entropies) if self.warmup_entropies else teacher_entropy
             self.tau_down = self.down_factor * self.h_warm
-            print(f"[gate] calibrated: H_warm={self.h_warm:.4f}  tau_down={self.tau_down:.4f}")
+            print(f"[gate] calibrated: H_warm={self.h_warm:.4g}  tau_down={self.tau_down:.4g}")
         if self.is_open and teacher_entropy < self.tau_down:
             self.is_open = False
         elif not self.is_open and teacher_entropy >= self.h_warm:
@@ -179,7 +179,10 @@ def train(args) -> None:
                 scored = score_rollout(model, t_prompt_ids, g, device, want_entropy=True)
                 t_logps.append(scored.logp)
                 entropies.append(scored.entropy)
-        teacher_entropy = torch.cat(entropies).median().item()
+        ent_all = torch.cat(entropies)
+        teacher_entropy_median = ent_all.median().item()
+        teacher_entropy_mean = ent_all.mean().item()
+        teacher_entropy = teacher_entropy_mean if args.gate_stat == "mean" else teacher_entropy_median
 
         # ---- 4. gate + effective lambda ----------------------------------------------
         gate_info = gate.update(step, teacher_entropy)
@@ -214,7 +217,9 @@ def train(args) -> None:
             "step": step + 1,
             "loss": total_loss,
             "reward_mean": rewards.mean().item(),
-            "teacher_entropy_median": teacher_entropy,
+            "teacher_entropy_median": teacher_entropy_median,
+            "teacher_entropy_mean": teacher_entropy_mean,
+            "gate_stat_value": teacher_entropy,
             "gate": gate_info["gate"],
             "lambda_eff": lam,
             "lr": scheduler.get_last_lr()[0],
@@ -236,7 +241,7 @@ def train(args) -> None:
 
         if (step + 1) % args.log_every == 0 or step == 0:
             print(f"[step {step+1:3d}/{args.total_steps}] loss={total_loss:+.4f} "
-                  f"reward={record['reward_mean']:.2f} H_T={teacher_entropy:.3f} "
+                  f"reward={record['reward_mean']:.2f} H_T(med/mean)={teacher_entropy_median:.4g}/{teacher_entropy_mean:.4g} "
                   f"gate={gate_info['gate']} lam={lam:.2f} "
                   f"gen_tok={record['avg_gen_tokens']:.0f} think_tok={record['avg_thought_tokens']:.0f} "
                   f"delib={record['avg_deliberation_markers']:.2f} u_mean={record['u_mean']:+.3f} "
@@ -259,6 +264,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir", default="outputs/antisd")
     p.add_argument("--total_steps", type=int, default=50)
     p.add_argument("--warmup_steps", type=int, default=5, help="gate calibration steps at lambda=0 (paper: 5)")
+    p.add_argument("--gate_stat", choices=["median", "mean"], default="median",
+                   help="teacher-entropy statistic the gate watches (paper: median; mean is more informative when the median is ~0)")
     p.add_argument("--group_size", type=int, default=4, help="rollouts per prompt, G")
     p.add_argument("--lambda_asd", type=float, default=0.5, help="AntiSD mixing weight (paper: 0.5; 0 = GRPO baseline)")
     p.add_argument("--lr", type=float, default=1e-5)
