@@ -1,7 +1,9 @@
-torch>=2.2.0
-transformers>=4.48.0
-peft>=0.10.0
-datasets>=2.18.0
-accelerate>=0.28.0
-bitsandbytes>=0.43.0
-huggingface_hub
+# Gemma 4 needs a current transformers; the model card says "latest version".
+torch>=2.5.0
+transformers>=5.0.0
+peft>=0.15.0
+datasets>=3.0.0
+accelerate>=1.0.0
+huggingface_hub>=0.30.0
+# Only needed for --load_in_4bit (QLoRA on 16 GB GPUs); Linux + CUDA only.
+bitsandbytes>=0.45.0; sys_platform == "linux"

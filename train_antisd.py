@@ -1,478 +1,283 @@
 """
-Anti-Self-Distillation (AntiSD) Training Script for Gemma 4
-Based on: "Anti-Self-Distillation for Reasoning RL via Pointwise Mutual Information" (Shen et al., 2026)
+Anti-Self-Distillation (AntiSD) training for Gemma 4 with LoRA.
 
-Key Components:
-1. Student Policy (pi_S): Evaluates rollout y given prompt x.
-2. Self-Teacher Policy (pi_T): Evaluates same rollout y given prompt x + privileged context c.
-3. JSD-derived Softplus Advantage: A_t^{AntiSD} = -0.5 * (softplus(u_t) - log(2)), where u_t = log pi_T - log pi_S.
-4. Auto-Calibrated Entropy Gate: Disables AntiSD if median teacher entropy collapses below tau_down = 0.93 * H_warm.
+Per training step, on one GSM8K problem x:
+  1. Sample G rollouts y ~ pi_S(. | x) with Gemma 4's native thinking mode on.
+  2. Score each rollout with the verifiable 0/1 reward -> GRPO sequence advantage A_i^seq.
+  3. Self-teacher pass (no grad): score the SAME tokens under pi_T(. | x, c), where c is the
+     verified solution plus correctness feedback. Record per-token entropy for the gate.
+  4. Student pass (grad): per-token log-probs under pi_S. u_t = log pi_T - log pi_S (= PMI).
+  5. A_t = A_i^seq + lambda * gate * ( -1/2 (softplus(u_t) - log 2) ).
+  6. REINFORCE update:  loss = - sum_t A_t log pi_S(y_t) / N_tokens.
+
+Setting --lambda_asd 0 gives the plain GRPO baseline with the identical pipeline.
+
+Reference: Shen et al. (2026), arXiv:2605.11609.
 """
 
-import os
-import re
-import math
+from __future__ import annotations
+
 import argparse
-from typing import List, Dict, Tuple, Optional
+import json
+import os
+import random
+import statistics
+import time
+from typing import Dict, List, Optional
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-    get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
+
+from antisd_common import (
+    antisd_advantage,
+    apply_lora,
+    compute_verifiable_reward,
+    count_deliberation_markers,
+    encode_prompt,
+    load_model_and_tokenizer,
+    pick_device,
+    privileged_context,
+    render_prompt,
+    sample_rollouts,
+    score_rollout,
+    split_thought_and_answer,
+    terminator_ids,
 )
-from peft import LoraConfig, get_peft_model
-from datasets import load_dataset
+
+SMOKE_PROBLEMS = [
+    ("Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. "
+     "How many clips did Natalia sell altogether in April and May?",
+     "Natalia sold 48/2 = 24 clips in May.\nNatalia sold 48+24 = 72 clips altogether.\n#### 72"),
+    ("Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. "
+     "How much did she earn?",
+     "Weng earns 12/60 = $0.2 per minute.\nFor 50 minutes she earned 0.2 * 50 = $10.\n#### 10"),
+    ("Betty is saving money for a new wallet which costs $100. Betty has only half of the money she "
+     "needs. Her parents decided to give her $15 for that purpose, and her grandparents twice as much "
+     "as her parents. How much more money does Betty need to buy the wallet?",
+     "Betty has 100/2 = $50.\nGrandparents gave 15*2 = $30.\nShe needs 100 - 50 - 30 - 15 = $5 more.\n#### 5"),
+]
 
 
-# ==========================================
-# 1. Answer Parsing & Verifiable Reward
-# ==========================================
+class SchmittEntropyGate:
+    """Auto-calibrated entropy gate from the paper.
 
-def extract_answer_number(text: str) -> Optional[float]:
+    During the first ``warmup_steps`` (lambda = 0) it records the median teacher
+    entropy H per step and sets H_warm = median of those. Afterwards the gate
+    closes when H < tau_down = 0.93 * H_warm and only reopens once H >= H_warm,
+    which stops it chattering when entropy hovers near the threshold.
     """
-    Extracts numerical answer from model output or GSM8K target.
-    Handles '#### 42', 'The answer is 42', boxed answers, or trailing floats.
-    """
-    # 1. Check GSM8K explicit delimiter
-    if "####" in text:
-        ans_part = text.split("####")[-1].strip().replace(",", "")
-        m = re.search(r"[-+]?\d*\.?\d+", ans_part)
-        if m:
-            try:
-                return float(m.group(0))
-            except ValueError:
-                pass
 
-    # 2. Check LaTeX \boxed{...}
-    boxed = re.findall(r"\\boxed\{([^}]+)\}", text)
-    if boxed:
-        m = re.search(r"[-+]?\d*\.?\d+", boxed[-1].replace(",", ""))
-        if m:
-            try:
-                return float(m.group(0))
-            except ValueError:
-                pass
-
-    # 3. Check common verbal templates
-    m = re.findall(r"(?:answer is|equals|result is)\s*[:=]?\s*(\$?\s*[-+]?\d*\.?\d+)", text, re.IGNORECASE)
-    if m:
-        cleaned = m[-1].replace("$", "").strip().replace(",", "")
-        try:
-            return float(cleaned)
-        except ValueError:
-            pass
-
-    # 4. Fallback to last numerical token in string
-    nums = re.findall(r"[-+]?\d*\.?\d+", text.replace(",", ""))
-    if nums:
-        try:
-            return float(nums[-1])
-        except ValueError:
-            pass
-
-    return None
-
-
-def compute_verifiable_reward(generated_text: str, ground_truth_text: str) -> float:
-    """Returns 1.0 if answers match numerically within 1e-4 tolerance, else 0.0."""
-    pred = extract_answer_number(generated_text)
-    gold = extract_answer_number(ground_truth_text)
-    if pred is not None and gold is not None:
-        return 1.0 if abs(pred - gold) < 1e-4 else 0.0
-    return 0.0
-
-
-# ==========================================
-# 2. AntiSD Math & Advantage Kernels
-# ==========================================
-
-def compute_token_logprobs(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    """
-    Gathers per-token log-probabilities for each token in input_ids.
-    logits: [B, L, V]
-    input_ids: [B, L]
-    returns: [B, L - 1] matching shifted token positions.
-    """
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
-    log_probs = F.log_softmax(shift_logits, dim=-1)
-    token_logp = log_probs.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
-    return token_logp
-
-
-def compute_entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
-    """
-    Computes per-token Shannon entropy H[P] = - sum P * log P in nats.
-    logits: [B, L, V]
-    returns: [B, L]
-    """
-    probs = F.softmax(logits, dim=-1)
-    log_probs = F.log_softmax(logits, dim=-1)
-    entropy = -torch.sum(probs * log_probs, dim=-1)
-    return entropy
-
-
-def compute_antisd_token_advantage(
-    student_logp: torch.Tensor,
-    teacher_logp: torch.Tensor,
-    gate_active: bool = True
-) -> torch.Tensor:
-    """
-    Computes per-token Anti-Self-Distillation advantage via JSD ascent:
-    u_t = t_t - s_t  (conditional Pointwise Mutual Information)
-    A_t^{AntiSD} = -phi(u_t) = -0.5 * (softplus(u_t) - log(2))
-
-    Properties:
-    - For deliberation tokens (u_t < 0): bounded positive bonus <= 0.5 * log(2) ~ +0.3466.
-    - For shortcut tokens (u_t > 0): proportional linear penalty ~ -0.5 * u_t.
-    """
-    u_t = teacher_logp - student_logp
-    # Softplus is strictly monotonic and numerically stable
-    antisd_adv = -0.5 * (F.softplus(u_t) - math.log(2.0))
-
-    if not gate_active:
-        antisd_adv = torch.zeros_like(antisd_adv)
-
-    return antisd_adv
-
-
-# ==========================================
-# 3. Prompt Formatting for Gemma 4
-# ==========================================
-
-def format_student_prompt(problem: str) -> str:
-    """Builds user prompt asking Gemma 4 to think inside <think> tags."""
-    return (
-        "<start_of_turn>user\n"
-        "Solve the following math problem step-by-step. "
-        "Show your intermediate thinking and reasoning inside <think> and </think> tags, "
-        "and conclude with your final answer as 'The answer is: <number>'.\n\n"
-        f"Problem: {problem}\n"
-        "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-        "<think>\n"
-    )
-
-
-def format_teacher_prompt(problem: str, ground_truth: str, is_correct: bool) -> str:
-    """
-    Builds privileged teacher context c:
-    Teacher sees the verified reference solution and correctness indicator.
-    """
-    assessment = "Your answer is correct." if is_correct else "Your answer is incorrect."
-    return (
-        "<start_of_turn>user\n"
-        "Solve the following math problem step-by-step. "
-        "Show your intermediate thinking and reasoning inside <think> and </think> tags, "
-        "and conclude with your final answer as 'The answer is: <number>'.\n\n"
-        f"Problem: {problem}\n\n"
-        f"[Privileged Context: Verified Reference Solution]\n"
-        f"{ground_truth}\n"
-        f"Previous assessment on this rollout attempt: {assessment}\n"
-        "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-        "<think>\n"
-    )
-
-
-# ==========================================
-# 4. AntiSD Trainer Loop
-# ==========================================
-
-class AntiSDTrainer:
-    def __init__(
-        self,
-        model_name: str = "google/gemma-4-e2b-it",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        load_in_4bit: bool = False,
-        lr: float = 5e-6,
-        lambda_asd: float = 0.1,
-        warmup_steps: int = 5,
-        total_steps: int = 50,
-        group_size: int = 4,
-        max_new_tokens: int = 512,
-        output_dir: str = "./gemma4_antisd_output"
-    ):
-        self.device = device
-        self.group_size = group_size
-        self.max_new_tokens = max_new_tokens
-        self.lambda_asd = lambda_asd
+    def __init__(self, warmup_steps: int, down_factor: float = 0.93):
         self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-
-        print(f"Loading tokenizer & model: {model_name}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Model Loading with optional QLoRA
-        bnb_config = None
-        if load_in_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16
-            )
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if self.device == "cuda" else None
-        )
-
-        # Apply LoRA
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM"
-        )
-        self.model = get_peft_model(self.model, lora_config)
-        self.model.print_trainable_parameters()
-
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.01)
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-        )
-
-        # Entropy Gate State (Schmitt Trigger)
+        self.down_factor = down_factor
+        self.warmup_entropies: List[float] = []
         self.h_warm: Optional[float] = None
         self.tau_down: Optional[float] = None
-        self.gate_is_open: bool = True
-        self.warmup_entropies: List[float] = []
+        self.is_open = True
 
-    def sample_rollouts(self, prompt_text: str) -> Tuple[List[str], List[str]]:
-        """Samples G candidate rollouts for a given prompt."""
-        self.model.eval()
-        enc = self.tokenizer(prompt_text, return_tensors="pt").to(self.device)
-        prompt_len = enc.input_ids.shape[1]
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=enc.input_ids,
-                attention_mask=enc.attention_mask,
-                max_new_tokens=self.max_new_tokens,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                num_return_sequences=self.group_size,
-                pad_token_id=self.tokenizer.pad_token_id
-            )
-
-        full_texts = []
-        gen_texts = []
-        for i in range(self.group_size):
-            full = self.tokenizer.decode(outputs[i], skip_special_tokens=False)
-            gen = self.tokenizer.decode(outputs[i][prompt_len:], skip_special_tokens=True)
-            full_texts.append(full)
-            gen_texts.append(gen)
-
-        return full_texts, gen_texts
-
-    def evaluate_sequence_logprobs(
-        self,
-        prompts: List[str],
-        rollouts: List[str]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        """
-        Tokenizes (prompt + rollout), computes forward pass, and returns:
-        - token_logp: [B, max_len]
-        - mask: [B, max_len] (1 for generated tokens, 0 for prompt/pad)
-        - logits: [B, max_len, V]
-        - median_entropy: scalar median entropy across generated tokens
-        """
-        combined_texts = [p + r for p, r in zip(prompts, rollouts)]
-        enc = self.tokenizer(
-            combined_texts,
-            padding=True,
-            truncation=True,
-            max_length=2048,
-            return_tensors="pt"
-        ).to(self.device)
-
-        input_ids = enc.input_ids
-        attention_mask = enc.attention_mask
-
-        # Forward pass
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-
-        # Log-probs for all tokens
-        token_logp = compute_token_logprobs(logits, input_ids)
-
-        # Create mask that isolates only generated tokens (excluding prompt and padding)
-        gen_mask = torch.zeros_like(token_logp)
-        entropies = []
-
-        for b in range(len(prompts)):
-            p_len = len(self.tokenizer(prompts[b]).input_ids)
-            total_len = attention_mask[b].sum().item()
-            # gen tokens start at p_len - 1 in the shifted sequence
-            start_idx = max(0, p_len - 1)
-            end_idx = max(start_idx, total_len - 1)
-            gen_mask[b, start_idx:end_idx] = 1.0
-
-            # compute entropy on generated slice
-            token_entropy = compute_entropy_from_logits(logits[b, start_idx:end_idx, :])
-            entropies.append(token_entropy.detach())
-
-        all_entropies = torch.cat(entropies) if entropies else torch.tensor([1.0], device=self.device)
-        median_h = torch.median(all_entropies).item()
-
-        return token_logp, gen_mask, logits, median_h
-
-    def update_step(self, problem: str, ground_truth: str, step_idx: int) -> Dict[str, float]:
-        """Executes a single AntiSD training step on 1 prompt with G rollouts."""
-        self.model.train()
-
-        # 1. Build Student Prompt and Sample G Rollouts
-        s_prompt = format_student_prompt(problem)
-        full_texts, gen_texts = self.sample_rollouts(s_prompt)
-
-        # 2. Compute Verifiable Trajectory Rewards (Scalar bit)
-        rewards = [compute_verifiable_reward(gen, ground_truth) for gen in gen_texts]
-        r_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        r_mean = r_tensor.mean().item()
-        r_std = r_tensor.std(unbiased=False).item() + 1e-6
-
-        # Standard GRPO normalized advantage: (R - mean) / std
-        seq_adv = (r_tensor - r_mean) / r_std
-
-        # 3. Student Forward Pass (pi_S)
-        s_prompts = [s_prompt] * self.group_size
-        s_logp, s_mask, s_logits, _ = self.evaluate_sequence_logprobs(s_prompts, gen_texts)
-
-        # 4. Teacher Forward Pass (pi_T with Privileged Context c)
-        # Teacher context depends on whether rollout was correct
-        t_prompts = [
-            format_teacher_prompt(problem, ground_truth, r > 0.5)
-            for r in rewards
-        ]
-
-        with torch.no_grad():
-            # Stop gradient on self-teacher
-            t_logp, t_mask, t_logits, teacher_median_h = self.evaluate_sequence_logprobs(t_prompts, gen_texts)
-
-        # Ensure masks match
-        active_mask = s_mask * t_mask
-
-        # 5. Entropy Gate Calibration & Schmitt Trigger
-        if step_idx < self.warmup_steps:
-            self.warmup_entropies.append(teacher_median_h)
-            current_lambda = 0.0  # Warmup at lambda = 0
-            gate_status = "calibrating"
-        else:
-            if self.h_warm is None:
-                self.h_warm = float(torch.median(torch.tensor(self.warmup_entropies)).item())
-                self.tau_down = 0.93 * self.h_warm
-                print(f"\n[Gate Calibrated] H_warm: {self.h_warm:.4f}, tau_down: {self.tau_down:.4f}\n")
-
-            # Schmitt Trigger Logic
-            if self.gate_is_open and teacher_median_h < self.tau_down:
-                self.gate_is_open = False  # Teacher entropy collapsed
-            elif not self.gate_is_open and teacher_median_h >= self.h_warm:
-                self.gate_is_open = True   # Teacher recovered
-
-            current_lambda = self.lambda_asd if self.gate_is_open else 0.0
-            gate_status = "open" if self.gate_is_open else "closed"
-
-        # 6. Compute AntiSD Advantage: -0.5 * (softplus(u_t) - log(2))
-        antisd_adv = compute_antisd_token_advantage(
-            student_logp=s_logp,
-            teacher_logp=t_logp,
-            gate_active=(current_lambda > 0)
-        )
-
-        # 7. Total Combined Advantage: A_i^{seq} + lambda * A_t^{AntiSD}
-        total_adv = seq_adv.unsqueeze(1) + (current_lambda * antisd_adv)
-
-        # 8. Policy Gradient Loss
-        # - sum( A_t * log pi_S(y_t) ) over active tokens
-        policy_loss = -(total_adv.detach() * s_logp * active_mask).sum() / (active_mask.sum() + 1e-8)
-
-        # Backward & Step
-        self.optimizer.zero_grad()
-        policy_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
-        self.scheduler.step()
-
-        return {
-            "loss": policy_loss.item(),
-            "reward_mean": r_mean,
-            "teacher_entropy": teacher_median_h,
-            "gate_status": gate_status,
-            "lambda": current_lambda,
-            "avg_tokens": float(active_mask.sum().item() / self.group_size)
-        }
+    def update(self, step: int, teacher_entropy: float) -> Dict[str, object]:
+        if step < self.warmup_steps:
+            self.warmup_entropies.append(teacher_entropy)
+            return {"gate": "calibrating", "gate_open": False}
+        if self.h_warm is None:
+            self.h_warm = statistics.median(self.warmup_entropies) if self.warmup_entropies else teacher_entropy
+            self.tau_down = self.down_factor * self.h_warm
+            print(f"[gate] calibrated: H_warm={self.h_warm:.4f}  tau_down={self.tau_down:.4f}")
+        if self.is_open and teacher_entropy < self.tau_down:
+            self.is_open = False
+        elif not self.is_open and teacher_entropy >= self.h_warm:
+            self.is_open = True
+        return {"gate": "open" if self.is_open else "closed", "gate_open": self.is_open}
 
 
-# ==========================================
-# 5. Main Execution Entry Point
-# ==========================================
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def main():
-    parser = argparse.ArgumentParser(description="Train Gemma 4 with Anti-Self-Distillation")
-    parser.add_argument("--model_name", type=str, default="google/gemma-4-e2b-it", help="Model name or path")
-    parser.add_argument("--dataset_name", type=str, default="gsm8k", help="Dataset name")
-    parser.add_argument("--total_steps", type=int, default=50, help="Total training steps")
-    parser.add_argument("--group_size", type=int, default=4, help="Rollouts per prompt (G)")
-    parser.add_argument("--lambda_asd", type=float, default=0.1, help="AntiSD mixing coefficient")
-    parser.add_argument("--load_in_4bit", action="store_true", help="Use 4-bit QLoRA for lower memory")
-    parser.add_argument("--output_dir", type=str, default="./antisd_gemma4_checkpoints", help="Save dir")
-    args = parser.parse_args()
 
-    print(f"\n=======================================================")
-    print(f" Anti-Self-Distillation (AntiSD) on Gemma 4")
-    print(f" Model: {args.model_name} | Dataset: {args.dataset_name}")
-    print(f" Total Steps: {args.total_steps} | Rollouts per prompt: {args.group_size}")
-    print(f"=======================================================\n")
+def load_problems(args) -> List[Dict[str, str]]:
+    if args.smoke_test:
+        return [{"question": q, "answer": a} for q, a in SMOKE_PROBLEMS]
+    from datasets import load_dataset
+    ds = load_dataset(args.dataset_name, args.dataset_config, split=args.dataset_split)
+    ds = ds.shuffle(seed=args.seed)
+    rows = []
+    for row in ds.select(range(min(len(ds), args.total_steps))):
+        rows.append({"question": row.get("question") or row.get("problem"),
+                     "answer": row.get("answer") or row.get("solution")})
+    return rows
 
-    # Load Dataset
-    print(f"Loading dataset: {args.dataset_name}...")
-    dataset = load_dataset(args.dataset_name, "main" if args.dataset_name == "gsm8k" else None, split="train")
 
-    trainer = AntiSDTrainer(
-        model_name=args.model_name,
-        load_in_4bit=args.load_in_4bit,
-        lambda_asd=args.lambda_asd,
-        total_steps=args.total_steps,
-        group_size=args.group_size,
-        output_dir=args.output_dir
-    )
+def decode_completion(tokenizer, gen_ids: List[int], stop_ids: List[int]) -> str:
+    """Decode keeping the thought-channel markers but dropping the end-of-turn token."""
+    keep = [t for t in gen_ids if t not in stop_ids]
+    return tokenizer.decode(keep, skip_special_tokens=False)
 
+
+def train(args) -> None:
+    set_seed(args.seed)
+    device = pick_device()
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "train_args.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    print(f"Loading {args.model_name} on {device} (4-bit={args.load_in_4bit})")
+    model, tokenizer = load_model_and_tokenizer(args.model_name, device, load_in_4bit=args.load_in_4bit)
+    model = apply_lora(model, r=args.lora_r, alpha=args.lora_alpha, load_in_4bit=args.load_in_4bit,
+                       gradient_checkpointing=args.gradient_checkpointing and device.type == "cuda")
+    model.print_trainable_parameters()
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.lr_warmup_steps,
+                                                num_training_steps=args.total_steps)
+    gate = SchmittEntropyGate(args.warmup_steps)
+    stop_ids = terminator_ids(tokenizer, model)
+    problems = load_problems(args)
+
+    metrics_path = os.path.join(args.output_dir, "metrics.jsonl")
+    rollouts_path = os.path.join(args.output_dir, "rollouts.jsonl")
+    metrics_f = open(metrics_path, "w")
+    rollouts_f = open(rollouts_path, "w")
+
+    print(f"Training {args.total_steps} steps, G={args.group_size}, lambda={args.lambda_asd}, "
+          f"warmup={args.warmup_steps}, max_new_tokens={args.max_new_tokens}")
+    t_start = time.time()
     for step in range(args.total_steps):
-        sample = dataset[step % len(dataset)]
-        problem = sample.get("question") or sample.get("problem")
-        solution = sample.get("answer") or sample.get("solution")
+        row = problems[step % len(problems)]
+        problem, gold = row["question"], row["answer"]
 
-        metrics = trainer.update_step(problem=problem, ground_truth=solution, step_idx=step)
+        # ---- 1. sample G rollouts from the student ---------------------------------
+        model.eval()
+        s_prompt_ids = encode_prompt(tokenizer, render_prompt(tokenizer, problem))
+        gens = sample_rollouts(model, tokenizer, s_prompt_ids, args.group_size,
+                               args.max_new_tokens, device,
+                               temperature=args.temperature, top_p=args.top_p, top_k=args.top_k)
+        gens = [g for g in gens if len(g) > 0]
+        if not gens:
+            print(f"[step {step+1}] all rollouts empty, skipping")
+            continue
+        completions = [decode_completion(tokenizer, g, stop_ids) for g in gens]
 
-        if (step + 1) % 5 == 0 or step == 0:
-            print(
-                f"[Step {step+1:02d}/{args.total_steps}] "
-                f"Loss: {metrics['loss']:.4f} | "
-                f"Reward: {metrics['reward_mean']:.2f} | "
-                f"Teacher H: {metrics['teacher_entropy']:.3f} | "
-                f"Gate: {metrics['gate_status']} (λ={metrics['lambda']:.2f}) | "
-                f"Tokens/trace: {metrics['avg_tokens']:.0f}"
-            )
+        # ---- 2. verifiable reward -> GRPO sequence advantage ------------------------
+        rewards = torch.tensor([compute_verifiable_reward(c, gold) for c in completions],
+                               dtype=torch.float32, device=device)
+        if len(gens) > 1 and rewards.std(unbiased=False) > 0:
+            seq_adv = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
+        else:
+            seq_adv = torch.zeros_like(rewards)
 
-    print("\nTraining complete! Saving LoRA adapter...")
-    trainer.model.save_pretrained(args.output_dir)
-    trainer.tokenizer.save_pretrained(args.output_dir)
-    print(f"Saved checkpoint to: {args.output_dir}")
+        # ---- 3. self-teacher pass with privileged context (no grad) -----------------
+        t_logps: List[torch.Tensor] = []
+        entropies: List[torch.Tensor] = []
+        with torch.no_grad():
+            for g, r in zip(gens, rewards.tolist()):
+                ctx = privileged_context(gold, is_correct=r > 0.5)
+                t_prompt_ids = encode_prompt(tokenizer, render_prompt(tokenizer, problem, ctx))
+                scored = score_rollout(model, t_prompt_ids, g, device, want_entropy=True)
+                t_logps.append(scored.logp)
+                entropies.append(scored.entropy)
+        teacher_entropy = torch.cat(entropies).median().item()
+
+        # ---- 4. gate + effective lambda ----------------------------------------------
+        gate_info = gate.update(step, teacher_entropy)
+        lam = args.lambda_asd if gate_info["gate_open"] else 0.0
+
+        # ---- 5./6. student pass, AntiSD advantage, REINFORCE update -----------------
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        n_tokens = sum(len(g) for g in gens)
+        total_loss = 0.0
+        u_all: List[torch.Tensor] = []
+        for i, g in enumerate(gens):
+            scored = score_rollout(model, s_prompt_ids, g, device)
+            s_logp = scored.logp
+            u_t = (t_logps[i] - s_logp.detach())
+            u_all.append(u_t)
+            adv = seq_adv[i] + lam * antisd_advantage(u_t)
+            loss = -(adv.detach() * s_logp).sum() / n_tokens
+            loss.backward()
+            total_loss += loss.item()
+        torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+
+        # ---- logging ------------------------------------------------------------------
+        u_cat = torch.cat(u_all)
+        thoughts = [split_thought_and_answer(c)[0] for c in completions]
+        thought_tokens = [len(tokenizer(t, add_special_tokens=False).input_ids) for t in thoughts]
+        delib = [count_deliberation_markers(t) for t in thoughts]
+        finished = [int(g[-1] in stop_ids) for g in gens]
+        record = {
+            "step": step + 1,
+            "loss": total_loss,
+            "reward_mean": rewards.mean().item(),
+            "teacher_entropy_median": teacher_entropy,
+            "gate": gate_info["gate"],
+            "lambda_eff": lam,
+            "lr": scheduler.get_last_lr()[0],
+            "avg_gen_tokens": n_tokens / len(gens),
+            "avg_thought_tokens": sum(thought_tokens) / len(gens),
+            "avg_deliberation_markers": sum(delib) / len(gens),
+            "frac_finished": sum(finished) / len(gens),
+            "u_mean": u_cat.mean().item(),
+            "u_frac_negative": (u_cat < 0).float().mean().item(),
+            "u_frac_below_-2": (u_cat < -2).float().mean().item(),
+            "elapsed_s": time.time() - t_start,
+        }
+        metrics_f.write(json.dumps(record) + "\n")
+        metrics_f.flush()
+        for i, c in enumerate(completions):
+            rollouts_f.write(json.dumps({"step": step + 1, "i": i, "reward": rewards[i].item(),
+                                         "problem": problem, "completion": c}) + "\n")
+        rollouts_f.flush()
+
+        if (step + 1) % args.log_every == 0 or step == 0:
+            print(f"[step {step+1:3d}/{args.total_steps}] loss={total_loss:+.4f} "
+                  f"reward={record['reward_mean']:.2f} H_T={teacher_entropy:.3f} "
+                  f"gate={gate_info['gate']} lam={lam:.2f} "
+                  f"gen_tok={record['avg_gen_tokens']:.0f} think_tok={record['avg_thought_tokens']:.0f} "
+                  f"delib={record['avg_deliberation_markers']:.2f} u_mean={record['u_mean']:+.3f} "
+                  f"[{record['elapsed_s']/60:.1f} min]")
+
+    metrics_f.close()
+    rollouts_f.close()
+    print(f"Saving LoRA adapter to {args.output_dir}")
+    model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print("Done.")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Anti-Self-Distillation on Gemma 4")
+    p.add_argument("--model_name", default="google/gemma-4-E2B-it")
+    p.add_argument("--dataset_name", default="openai/gsm8k")
+    p.add_argument("--dataset_config", default="main")
+    p.add_argument("--dataset_split", default="train")
+    p.add_argument("--output_dir", default="outputs/antisd")
+    p.add_argument("--total_steps", type=int, default=50)
+    p.add_argument("--warmup_steps", type=int, default=5, help="gate calibration steps at lambda=0 (paper: 5)")
+    p.add_argument("--group_size", type=int, default=4, help="rollouts per prompt, G")
+    p.add_argument("--lambda_asd", type=float, default=0.5, help="AntiSD mixing weight (paper: 0.5; 0 = GRPO baseline)")
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--lr_warmup_steps", type=int, default=2)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
+    p.add_argument("--max_new_tokens", type=int, default=1024)
+    p.add_argument("--temperature", type=float, default=1.0, help="Gemma 4 recommended sampling: T=1.0")
+    p.add_argument("--top_p", type=float, default=0.95)
+    p.add_argument("--top_k", type=int, default=64)
+    p.add_argument("--lora_r", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--load_in_4bit", action="store_true", help="QLoRA for 16 GB GPUs such as a Colab T4")
+    p.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing", action="store_false")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--log_every", type=int, default=5)
+    p.add_argument("--smoke_test", action="store_true",
+                   help="use 3 built-in problems (no dataset download); pair with a tiny model to test the loop")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    train(parse_args())

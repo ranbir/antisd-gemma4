@@ -1,209 +1,175 @@
 """
-Pointwise Mutual Information (PMI) Token Inspector for Reasoning Models
-Visualizes Shortcut vs. Deliberation tokens along a reasoning rollout.
+Pointwise Mutual Information (PMI) inspector for reasoning traces.
 
-u_t = log pi_T(y_t) - log pi_S(y_t)
-- u_t << 0: Deliberation tokens (Wait, Let, Maybe, backtracks) -> BLUE
-- u_t >> 0: Shortcut tokens (formulas, therefore, answers)      -> RED
-- u_t ~= 0: Neutral tokens                                      -> GRAY
+Samples one rollout from the student, then scores the *same tokens* under the
+student (no context) and the self-teacher (verified solution + grading), and
+prints / renders
+
+    u_t = log pi_T(y_t | x, c, y_<t) - log pi_S(y_t | x, y_<t)
+
+per token.  u_t << 0 (blue) are deliberation tokens the teacher dislikes and
+AntiSD rewards; u_t >> 0 (red) are shortcut tokens the teacher loves and
+AntiSD penalises.  Works for the base model or a trained adapter.
+
+Usage:
+  python inspect_pmi.py --gsm8k_index 3 --html_out assets/pmi_base.html
+  python inspect_pmi.py --adapter_dir outputs/antisd --gsm8k_index 3 --html_out assets/pmi_antisd.html
 """
 
-import sys
-import math
+from __future__ import annotations
+
 import argparse
+import html
+import json
+import os
+import random
+from typing import List, Tuple
+
 import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from antisd_common import (
+    antisd_advantage,
+    compute_verifiable_reward,
+    encode_prompt,
+    load_model_and_tokenizer,
+    pick_device,
+    privileged_context,
+    render_prompt,
+    sample_rollouts,
+    score_rollout,
+    terminator_ids,
+)
 
 
-def format_student_prompt(problem: str) -> str:
-    return (
-        "<start_of_turn>user\n"
-        "Solve the following math problem step-by-step. "
-        "Show your intermediate thinking and reasoning inside <think> and </think> tags, "
-        "and conclude with your final answer as 'The answer is: <number>'.\n\n"
-        f"Problem: {problem}\n"
-        "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-        "<think>\n"
-    )
+def colorize_terminal(token: str, u: float) -> str:
+    if u <= -2.0:
+        return f"\033[1;36m{token}\033[0m"   # bold cyan: strong deliberation
+    if u < -0.5:
+        return f"\033[34m{token}\033[0m"     # blue
+    if u >= 2.0:
+        return f"\033[1;31m{token}\033[0m"   # bold red: strong shortcut
+    if u > 0.5:
+        return f"\033[33m{token}\033[0m"     # yellow
+    return f"\033[90m{token}\033[0m"         # grey: neutral
 
 
-def format_teacher_prompt(problem: str, ground_truth: str, assessment: str = "correct") -> str:
-    return (
-        "<start_of_turn>user\n"
-        "Solve the following math problem step-by-step. "
-        "Show your intermediate thinking and reasoning inside <think> and </think> tags, "
-        "and conclude with your final answer as 'The answer is: <number>'.\n\n"
-        f"Problem: {problem}\n\n"
-        f"[Privileged Context: Verified Reference Solution]\n"
-        f"{ground_truth}\n"
-        f"Previous assessment on this rollout attempt: Your answer is {assessment}.\n"
-        "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-        "<think>\n"
-    )
-
-
-def colorize_terminal(token: str, u_val: float) -> str:
-    """Formats a token with ANSI color escape codes based on PMI value u_val."""
-    # u_val < -1.5: Deep Blue / Cyan (Deliberation)
-    # u_val > +1.5: Deep Red / Yellow (Shortcut)
-    if u_val <= -2.0:
-        return f"\033[1;36m{token}\033[0m"  # Bold Cyan
-    elif u_val < -0.5:
-        return f"\033[34m{token}\033[0m"    # Blue
-    elif u_val >= 2.0:
-        return f"\033[1;31m{token}\033[0m"  # Bold Red
-    elif u_val > 0.5:
-        return f"\033[33m{token}\033[0m"    # Yellow
-    else:
-        return f"\033[90m{token}\033[0m"    # Muted Gray
-
-
-def generate_html_heatmap(tokens_and_pmi, output_html_path: str):
-    """Generates a standalone, beautiful HTML visualization for blog posts."""
-    html_spans = []
-    for token, u_val in tokens_and_pmi:
-        safe_token = token.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
-        if u_val <= -1.0:
-            # Blue shade for deliberation
-            intensity = min(1.0, abs(u_val) / 5.0)
-            bg = f"rgba(0, 180, 255, {intensity * 0.7 + 0.15:.2f})"
-            color = "#003366"
-        elif u_val >= 1.0:
-            # Red shade for shortcuts
-            intensity = min(1.0, u_val / 5.0)
-            bg = f"rgba(255, 60, 60, {intensity * 0.7 + 0.15:.2f})"
-            color = "#660000"
+def render_html(tokens_and_u: List[Tuple[str, float]], title: str, stats: dict, out_path: str) -> None:
+    spans = []
+    for tok, u in tokens_and_u:
+        safe = html.escape(tok).replace("\n", "<br>")
+        if u <= -1.0:
+            a = min(1.0, abs(u) / 5.0) * 0.7 + 0.15
+            style = f"background: rgba(0,150,255,{a:.2f}); color:#00294d;"
+        elif u >= 1.0:
+            a = min(1.0, u / 5.0) * 0.7 + 0.15
+            style = f"background: rgba(255,60,60,{a:.2f}); color:#4d0000;"
         else:
-            bg = "transparent"
-            color = "#333333"
-
-        html_spans.append(
-            f'<span style="background-color: {bg}; color: {color}; padding: 1px 3px; '
-            f'border-radius: 3px; margin: 1px; font-family: monospace;" '
-            f'title="PMI u_t: {u_val:.3f}">{safe_token}</span>'
-        )
-
-    full_html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>AntiSD Pointwise Mutual Information (PMI) Trace</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 30px; background: #fafafa; }}
-        .card {{ background: white; border: 1px solid #e0e0e0; border-radius: 8px; padding: 24px; max-width: 900px; margin: 0 auto; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
-        .legend {{ display: flex; gap: 20px; margin-bottom: 20px; font-size: 14px; align-items: center; }}
-        .box {{ width: 14px; height: 14px; border-radius: 3px; display: inline-block; vertical-align: middle; margin-right: 6px; }}
-        .trace-box {{ line-height: 2.0; font-size: 15px; border-top: 1px solid #eee; padding-top: 16px; word-wrap: break-word; }}
-    </style>
-</head>
-<body>
-<div class="card">
-    <h2>Anti-Self-Distillation: Pointwise Mutual Information (PMI) Token Trace</h2>
-    <div class="legend">
-        <div><span class="box" style="background: rgba(0, 180, 255, 0.6);"></span><b>Deliberation Tokens</b> (u_t &lt;&lt; 0, Rewarded by AntiSD)</div>
-        <div><span class="box" style="background: rgba(255, 60, 60, 0.6);"></span><b>Shortcut Tokens</b> (u_t &gt;&gt; 0, Penalized by AntiSD)</div>
-        <div><span class="box" style="background: #e0e0e0;"></span><b>Neutral Tokens</b> (u_t &asymp; 0)</div>
-    </div>
-    <div class="trace-box">
-        {"".join(html_spans)}
-    </div>
+            style = "color:#333;"
+        spans.append(f'<span style="{style} padding:1px 2px; border-radius:3px;" '
+                     f'title="u_t = {u:+.2f}">{safe}</span>')
+    stat_rows = "".join(f"<tr><td>{html.escape(k)}</td><td>{v}</td></tr>" for k, v in stats.items())
+    doc = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
+<style>
+ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 24px; background:#fafafa; }}
+ .card {{ background:#fff; border:1px solid #e3e3e3; border-radius:8px; padding:24px; max-width:960px; margin:0 auto; }}
+ .legend span.box {{ display:inline-block; width:14px; height:14px; border-radius:3px; vertical-align:middle; margin-right:6px; }}
+ .legend {{ display:flex; gap:24px; font-size:14px; margin:12px 0 18px; }}
+ .trace {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:14px; line-height:2.0; border-top:1px solid #eee; padding-top:14px; white-space:pre-wrap; word-wrap:break-word; }}
+ table {{ font-size:13px; border-collapse:collapse; margin-top:16px; }} td {{ padding:2px 12px 2px 0; }}
+</style></head><body><div class="card">
+<h2>{html.escape(title)}</h2>
+<div class="legend">
+ <div><span class="box" style="background:rgba(0,150,255,.6)"></span><b>Deliberation</b> (u_t &lt;&lt; 0, rewarded by AntiSD)</div>
+ <div><span class="box" style="background:rgba(255,60,60,.6)"></span><b>Shortcut</b> (u_t &gt;&gt; 0, penalised by AntiSD)</div>
+ <div><span class="box" style="background:#e0e0e0"></span><b>Neutral</b> (u_t &asymp; 0)</div>
 </div>
-</body>
-</html>
-"""
-    with open(output_html_path, "w", encoding="utf-8") as f:
-        f.write(full_html)
-    print(f"\nSaved interactive HTML visualization to: {output_html_path}")
+<div class="trace">{"".join(spans)}</div>
+<table>{stat_rows}</table>
+</div></body></html>"""
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(doc)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Inspect PMI tokens on reasoning traces")
-    parser.add_argument("--model_name", type=str, default="google/gemma-4-e2b-it")
-    parser.add_argument("--problem", type=str, default="Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell in total?")
-    parser.add_argument("--ground_truth", type=str, default="Natalia sold 48/2 = 24 clips in May. In total she sold 48 + 24 = 72 clips. The answer is 72.")
-    parser.add_argument("--html_out", type=str, default="pmi_trace_visualization.html")
-    args = parser.parse_args()
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--model_name", default="google/gemma-4-E2B-it")
+    p.add_argument("--adapter_dir", default=None)
+    p.add_argument("--problem", default=None)
+    p.add_argument("--ground_truth", default=None)
+    p.add_argument("--gsm8k_index", type=int, default=None, help="use this GSM8K test problem instead of --problem")
+    p.add_argument("--max_new_tokens", type=int, default=1024)
+    p.add_argument("--greedy", action="store_true")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--top_n", type=int, default=15, help="how many extreme tokens to list")
+    p.add_argument("--html_out", default="outputs/pmi_trace.html")
+    p.add_argument("--json_out", default=None, help="optional: dump (token, u_t) pairs")
+    p.add_argument("--load_in_4bit", action="store_true")
+    args = p.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading {args.model_name} on {device}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if device == "cuda" else None
-    )
-    model.eval()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = pick_device()
 
-    s_prompt = format_student_prompt(args.problem)
-    t_prompt = format_teacher_prompt(args.problem, args.ground_truth, assessment="correct")
+    if args.gsm8k_index is not None:
+        from datasets import load_dataset
+        row = load_dataset("openai/gsm8k", "main", split="test")[args.gsm8k_index]
+        problem, gold = row["question"], row["answer"]
+    else:
+        problem = args.problem or ("Natalia sold clips to 48 of her friends in April, and then she sold half "
+                                   "as many clips in May. How many clips did Natalia sell altogether in April and May?")
+        gold = args.ground_truth or "Natalia sold 48/2 = 24 clips in May.\nNatalia sold 48+24 = 72 clips.\n#### 72"
 
-    # 1. Sample Rollout from Student
-    print("Generating student reasoning rollout...")
-    s_enc = tokenizer(s_prompt, return_tensors="pt").to(device)
-    prompt_len = s_enc.input_ids.shape[1]
+    model, tokenizer = load_model_and_tokenizer(args.model_name, device, args.load_in_4bit, args.adapter_dir)
+    stop_ids = terminator_ids(tokenizer, model)
 
+    s_prompt_ids = encode_prompt(tokenizer, render_prompt(tokenizer, problem))
+    gen = sample_rollouts(model, tokenizer, s_prompt_ids, 1, args.max_new_tokens, device, greedy=args.greedy)[0]
+    completion = tokenizer.decode([t for t in gen if t not in stop_ids], skip_special_tokens=False)
+    reward = compute_verifiable_reward(completion, gold)
+
+    t_prompt_ids = encode_prompt(tokenizer, render_prompt(tokenizer, problem, privileged_context(gold, reward > 0.5)))
     with torch.no_grad():
-        out = model.generate(
-            input_ids=s_enc.input_ids,
-            attention_mask=s_enc.attention_mask,
-            max_new_tokens=512,
-            temperature=0.7,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id
-        )
+        s = score_rollout(model, s_prompt_ids, gen, device)
+        t = score_rollout(model, t_prompt_ids, gen, device)
+    u = (t.logp - s.logp).cpu()
+    adv = antisd_advantage(u)
+    toks = [tokenizer.decode([tid]) for tid in gen]
+    pairs = list(zip(toks, u.tolist()))
 
-    gen_token_ids = out[0][prompt_len:]
-    rollout_text = tokenizer.decode(gen_token_ids, skip_special_tokens=True)
+    print("\n" + "=" * 72)
+    print(" PMI trace   cyan/blue = deliberation (u<<0)   red/yellow = shortcut (u>>0)")
+    print("=" * 72)
+    print("".join(colorize_terminal(tok, val) for tok, val in pairs))
+    print("=" * 72)
 
-    # 2. Re-evaluate student and teacher log-probs on the exact same rollout
-    s_full_text = s_prompt + rollout_text
-    t_full_text = t_prompt + rollout_text
+    order = sorted(range(len(pairs)), key=lambda i: pairs[i][1])
+    print(f"\nMost NEGATIVE u_t (teacher dislikes; AntiSD rewards, capped at +{0.5*0.6931:.3f}):")
+    for i in order[:args.top_n]:
+        print(f"  {pairs[i][1]:+7.2f}  adv={adv[i].item():+.3f}  {pairs[i][0]!r}")
+    print(f"\nMost POSITIVE u_t (teacher loves; AntiSD penalises linearly):")
+    for i in order[::-1][:args.top_n]:
+        print(f"  {pairs[i][1]:+7.2f}  adv={adv[i].item():+.3f}  {pairs[i][0]!r}")
 
-    s_inputs = tokenizer(s_full_text, return_tensors="pt").to(device)
-    t_inputs = tokenizer(t_full_text, return_tensors="pt").to(device)
-
-    with torch.no_grad():
-        s_logits = model(**s_inputs).logits[0]
-        t_logits = model(**t_inputs).logits[0]
-
-    s_logprobs = F.log_softmax(s_logits[:-1], dim=-1)
-    t_logprobs = F.log_softmax(t_logits[:-1], dim=-1)
-
-    s_labels = s_inputs.input_ids[0][1:]
-    t_labels = t_inputs.input_ids[0][1:]
-
-    s_token_logp = s_logprobs.gather(dim=-1, index=s_labels.unsqueeze(-1)).squeeze(-1)
-    t_token_logp = t_logprobs.gather(dim=-1, index=t_labels.unsqueeze(-1)).squeeze(-1)
-
-    # Align generated slice
-    gen_len = len(gen_token_ids)
-    s_gen_logp = s_token_logp[-gen_len:]
-    t_gen_logp = t_token_logp[-gen_len:]
-
-    u_t = (t_gen_logp - s_gen_logp).cpu().float().numpy()
-
-    # 3. Print Colorized Trace to Terminal
-    print("\n" + "=" * 60)
-    print(" COLORIZED POINTWISE MUTUAL INFORMATION (PMI) TRACE")
-    print(" CYAN/BLUE = Deliberation (u_t << 0) | RED/YELLOW = Shortcut (u_t >> 0)")
-    print("=" * 60 + "\n<think>\n")
-
-    token_strings = [tokenizer.decode([tid]) for tid in gen_token_ids]
-    colored_text = []
-    tokens_and_pmi = []
-
-    for tok_str, u_val in zip(token_strings, u_t):
-        colored_text.append(colorize_terminal(tok_str, float(u_val)))
-        tokens_and_pmi.append((tok_str, float(u_val)))
-
-    print("".join(colored_text))
-    print("\n" + "=" * 60)
-
-    # Generate HTML visualization
-    generate_html_heatmap(tokens_and_pmi, args.html_out)
+    stats = {
+        "adapter": args.adapter_dir or "(base model)",
+        "answer correct": bool(reward),
+        "generated tokens": len(gen),
+        "mean u_t": f"{u.mean().item():+.3f}",
+        "fraction u_t < 0": f"{(u < 0).float().mean().item():.2f}",
+        "fraction u_t < -2": f"{(u < -2).float().mean().item():.2f}",
+        "fraction u_t > +2": f"{(u > 2).float().mean().item():.2f}",
+        "mean AntiSD advantage": f"{adv.mean().item():+.3f}",
+    }
+    print("\n" + json.dumps(stats, indent=2))
+    render_html(pairs, "AntiSD: per-token PMI on a Gemma 4 reasoning trace", stats, args.html_out)
+    print(f"Wrote {args.html_out}")
+    if args.json_out:
+        with open(args.json_out, "w") as f:
+            json.dump({"problem": problem, "gold": gold, "completion": completion, "stats": stats,
+                       "tokens": [{"token": tk, "u": val} for tk, val in pairs]}, f, indent=1)
+        print(f"Wrote {args.json_out}")
 
 
 if __name__ == "__main__":
