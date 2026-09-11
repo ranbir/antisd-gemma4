@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints & Weights
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+*_output/
+*_adapter/
+gemma4_antisd_checkpoints/
+gemma4_antisd_adapter/
+
+# Environments & Virtualenv
+.venv/
+env/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Internal recording / meeting files
+Anti Self Distillation/
+*.html
+
+# OS artifacts
+.DS_Store
+Thumbs.db
