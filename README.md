@@ -38,7 +38,6 @@ $0.93\,H_{\text{warm}}$) switches the term off if the teacher's entropy collapse
 | `eval_antisd.py` | Held-out GSM8K evaluation: pass@1, thought length, deliberation markers, per-example completions. |
 | `inspect_pmi.py` | Samples a trace and colours every token by $u_t$. Terminal output plus a standalone HTML heatmap. |
 | `antisd_gemma4_colab.ipynb` | Drives the three scripts end to end on a Colab GPU. Regenerate with `python make_notebook.py`. |
-| `HUGGINGFACE_BLOG_POST.md` | The blog post draft. |
 
 ## Quickstart
 

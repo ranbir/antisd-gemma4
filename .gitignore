@@ -20,3 +20,8 @@ Anti Self Distillation/
 # OS
 .DS_Store
 Thumbs.db
+
+# Drafts and notes stay local; only README files are published.
+*.md
+!README.md
+!**/README.md
