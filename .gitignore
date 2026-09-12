@@ -26,3 +26,7 @@ Thumbs.db
 !README.md
 !**/README.md
 .gstack/
+
+# Local run archives (results are summarised in the blog, not committed)
+runs/
+*_results.zip
