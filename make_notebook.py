@@ -87,7 +87,7 @@ LR = 1e-4           # LoRA learning rate (1e-5 in run1 was too low to move the a
 MAX_NEW = 2048      # generation budget for thinking + answer (1024 left ~35% of traces unfinished)
 N_EVAL = 200        # held-out GSM8K test problems (std. error ~3.3 points at 200)
 SEED = 0
-EVAL_BS = 4 if FOURBIT else 16   # problems generated at once during evaluation
+EVAL_BS = 4 if FOURBIT else 32   # problems generated at once during evaluation
 import os; os.makedirs(f"outputs/{RUN}", exist_ok=True)
 """),
     code("""
@@ -165,9 +165,24 @@ print("\\n===== BASE (correct=%s) =====\\n" % base[i]["correct"], base[i]["compl
 print("\\n===== ANTISD (correct=%s) =====\\n" % anti[i]["correct"], anti[i]["completion"])
 """),
     code("""
-# 14. (Optional) push the AntiSD adapter to the Hub
-# from huggingface_hub import HfApi
-# HfApi().upload_folder(folder_path=f"outputs/{RUN}/antisd", repo_id="YOUR_USERNAME/gemma-4-e2b-it-antisd", repo_type="model")
+# 14. Publish: adapters to the Hub, result files into the repo's results/ folder.
+#     Needs a WRITE token in the HF_TOKEN secret. Set HF_USER to your username.
+HF_USER = "ribnar"
+PUBLISH = False   # flip to True after checking the table above
+if PUBLISH:
+    from huggingface_hub import HfApi
+    api = HfApi()
+    for name in ("grpo", "antisd"):
+        repo = f"{HF_USER}/gemma-4-e2b-it-{name}-{RUN}"
+        api.create_repo(repo, repo_type="model", exist_ok=True)
+        api.upload_folder(folder_path=f"outputs/{RUN}/{name}", repo_id=repo, repo_type="model",
+                          ignore_patterns=["rollouts.jsonl", "checkpoint-*"])
+        print("uploaded", repo)
+    # eval summaries + per-example records (no adapters) go in the git repo so the demo needs no compute
+    !mkdir -p results/{RUN} && cp outputs/{RUN}/eval_*.json outputs/{RUN}/pmi_*.json results/{RUN}/ \\
+        && cp outputs/{RUN}/grpo/metrics.jsonl results/{RUN}/grpo_metrics.jsonl \\
+        && cp outputs/{RUN}/antisd/metrics.jsonl results/{RUN}/antisd_metrics.jsonl && ls -la results/{RUN}
+    print("now: git add results/ assets/ && git commit && git push (from a machine with push access)")
 """),
     code("""
 # 15. Bundle every result file for this run and download it
@@ -191,3 +206,78 @@ nb = {
 with open("antisd_gemma4_colab.ipynb", "w") as f:
     json.dump(nb, f, indent=1)
 print("wrote antisd_gemma4_colab.ipynb with", len(cells), "cells")
+
+
+# ---------------------------------------------------------------------------
+# Demo notebook: no training. Loads the published adapters and shows the effect
+# on one problem in a few minutes on a free T4.
+# ---------------------------------------------------------------------------
+demo_cells = [
+    md("""
+# AntiSD on Gemma 4: five-minute demo
+
+Companion to the blog post *Teaching Gemma 4 to Hesitate*. This notebook does **no training**.
+It loads `google/gemma-4-E2B-it` plus the LoRA adapters trained in the post, then on a GSM8K
+problem of your choice it
+
+1. shows the results table from the published evaluation files (no compute),
+2. renders the per-token PMI heatmap for the base model and the AntiSD adapter,
+3. prints the two greedy traces side by side.
+
+A free T4 is enough (the model loads in 4-bit there). Full reproduction, about seven hours on an
+A100, is the other notebook: `antisd_gemma4_colab.ipynb`.
+"""),
+    code("""
+# 1. Setup (about 2 minutes)
+!pip install -q -U transformers peft datasets accelerate bitsandbytes
+!pip uninstall -q -y torchao 2>/dev/null || true
+import os, torch
+if not os.path.exists("antisd-gemma4"):
+    !git clone -q https://github.com/ranbir/antisd-gemma4.git
+%cd antisd-gemma4
+FOURBIT = "--load_in_4bit" if (torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < 20e9) else ""
+print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none", "| 4-bit:", bool(FOURBIT))
+"""),
+    code("""
+# 2. Published results (read from the repo; nothing runs)
+import json, glob, pandas as pd
+RUN = "run2"
+rows = []
+for name, path in [("Gemma 4 E2B (base)", f"results/{RUN}/eval_base.json"),
+                   ("+ GRPO", f"results/{RUN}/eval_grpo.json"),
+                   ("+ AntiSD", f"results/{RUN}/eval_antisd.json")]:
+    if os.path.exists(path):
+        s = json.load(open(path))["summary"]
+        rows.append({"method": name, "pass@1 (%)": round(100*s["accuracy"],1), "thought tokens": round(s["avg_thought_tokens"]),
+                     "deliberation markers / trace": round(s["avg_deliberation_markers"],2),
+                     "unfinished (%)": round(100*s["frac_unfinished"],1), "n": s["n_problems"]})
+display(pd.DataFrame(rows).set_index("method")) if rows else print("results/ not published yet")
+"""),
+    code("""
+# 3. Pick a held-out problem and the adapter to compare against the base model
+IDX = 3                                            # GSM8K test index; try 21 or 28 for problems the base gets wrong
+ADAPTER = "ribnar/gemma-4-e2b-it-antisd-run2"      # Hub id of the AntiSD adapter from the post
+!python inspect_pmi.py --gsm8k_index {IDX} --greedy --max_new_tokens 2048 {FOURBIT} \\
+    --html_out demo_base.html --json_out demo_base.json
+!python inspect_pmi.py --gsm8k_index {IDX} --greedy --max_new_tokens 2048 {FOURBIT} --adapter_dir {ADAPTER} \\
+    --html_out demo_antisd.html --json_out demo_antisd.json
+"""),
+    code("""
+# 4. Heatmaps: blue = tokens the answer-key teacher dislikes (rewarded by AntiSD)
+from IPython.display import HTML, display
+display(HTML(open("demo_base.html").read()))
+display(HTML(open("demo_antisd.html").read()))
+"""),
+    code("""
+# 5. Traces side by side
+b, a = json.load(open("demo_base.json")), json.load(open("demo_antisd.json"))
+print("PROBLEM:", b["problem"], "\\nGOLD:", b["gold"].split("####")[-1].strip())
+print("\\n===== BASE =====\\n", b["completion"])
+print("\\n===== ANTISD =====\\n", a["completion"])
+print("\\nstats base:", b["stats"], "\\nstats antisd:", a["stats"])
+"""),
+]
+demo = dict(nb); demo["cells"] = demo_cells
+with open("antisd_gemma4_demo.ipynb", "w") as f:
+    json.dump(demo, f, indent=1)
+print("wrote antisd_gemma4_demo.ipynb with", len(demo_cells), "cells")

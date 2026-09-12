@@ -38,7 +38,7 @@ from antisd_common import (
     pick_device,
     privileged_context,
     render_prompt,
-    sample_rollouts,
+    sample_rollouts_batched,
     score_rollout,
     split_thought_and_answer,
     terminator_ids,
@@ -159,19 +159,26 @@ def train(args) -> None:
     metrics_f = open(metrics_path, "w")
     rollouts_f = open(rollouts_path, "w")
 
-    print(f"Training {args.total_steps} steps, G={args.group_size}, lambda={args.lambda_asd}, "
-          f"warmup={args.warmup_steps}, max_new_tokens={args.max_new_tokens}")
+    print(f"Training {args.total_steps} steps, G={args.group_size}, B={args.problems_per_batch} problems/generate, "
+          f"lambda={args.lambda_asd}, warmup={args.warmup_steps}, max_new_tokens={args.max_new_tokens}")
     t_start = time.time()
+    buffer: List[tuple] = []  # (problem, gold, prompt_ids, gens) awaiting an update
     for step in range(args.total_steps):
-        row = problems[step % len(problems)]
-        problem, gold = row["question"], row["answer"]
-
-        # ---- 1. sample G rollouts from the student ---------------------------------
-        model.eval()
-        s_prompt_ids = encode_prompt(tokenizer, render_prompt(tokenizer, problem))
-        gens = sample_rollouts(model, tokenizer, s_prompt_ids, args.group_size,
-                               args.max_new_tokens, device,
-                               temperature=args.temperature, top_p=args.top_p, top_k=args.top_k)
+        # ---- 1. sample G rollouts per problem, B problems per generate() call ---------
+        # Decoding is memory-bound, so B prompts cost little more than one. Updates
+        # still happen one problem at a time; problems 2..B in a batch are trained on
+        # weights up to B-1 updates old (standard rollout batching, mild staleness).
+        if not buffer:
+            model.eval()
+            batch_rows = [problems[(step + k) % len(problems)]
+                          for k in range(min(args.problems_per_batch, args.total_steps - step))]
+            prompt_ids = [encode_prompt(tokenizer, render_prompt(tokenizer, r["question"])) for r in batch_rows]
+            per_prompt = sample_rollouts_batched(model, tokenizer, prompt_ids, args.group_size,
+                                                 args.max_new_tokens, device, temperature=args.temperature,
+                                                 top_p=args.top_p, top_k=args.top_k)
+            buffer = [(r["question"], r["answer"], pid, gens)
+                      for r, pid, gens in zip(batch_rows, prompt_ids, per_prompt)]
+        problem, gold, s_prompt_ids, gens = buffer.pop(0)
         gens = [g for g in gens if len(g) > 0]
         if not gens:
             print(f"[step {step+1}] all rollouts empty, skipping")
@@ -256,6 +263,11 @@ def train(args) -> None:
                                          "problem": problem, "completion": c}) + "\n")
         rollouts_f.flush()
 
+        if args.save_every and (step + 1) % args.save_every == 0 and step + 1 < args.total_steps:
+            ck = os.path.join(args.output_dir, f"checkpoint-{step+1}")
+            model.save_pretrained(ck)
+            print(f"[checkpoint] saved {ck}")
+
         if (step + 1) % args.log_every == 0 or step == 0:
             print(f"[step {step+1:3d}/{args.total_steps}] loss={total_loss:+.4f} "
                   f"reward={record['reward_mean']:.2f} H_T(med/mean)={teacher_entropy_median:.4g}/{teacher_entropy_mean:.4g} "
@@ -284,6 +296,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gate_stat", choices=["median", "mean"], default="median",
                    help="teacher-entropy statistic the gate watches (paper: median; mean is more informative when the median is ~0)")
     p.add_argument("--group_size", type=int, default=4, help="rollouts per prompt, G")
+    p.add_argument("--problems_per_batch", type=int, default=4,
+                   help="problems sampled per generate() call; updates stay one problem per step (1 = fully on-policy)")
+    p.add_argument("--save_every", type=int, default=25, help="save an adapter checkpoint every N steps (0 = off)")
     p.add_argument("--lambda_asd", type=float, default=0.5, help="AntiSD mixing weight (paper: 0.5; 0 = GRPO baseline)")
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--lr_warmup_steps", type=int, default=2)

@@ -30,3 +30,6 @@ Thumbs.db
 # Local run archives (results are summarised in the blog, not committed)
 runs/
 *_results.zip
+
+# Local HTML preview of the post
+HUGGINGFACE_BLOG_POST.html

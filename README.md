@@ -1,6 +1,7 @@
 # Anti-Self-Distillation (AntiSD) on Gemma 4
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ranbir/antisd-gemma4/blob/main/antisd_gemma4_colab.ipynb)
+[![Demo (5 min, free T4)](https://img.shields.io/badge/Colab-5--minute_demo-F9AB00?logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/ranbir/antisd-gemma4/blob/main/antisd_gemma4_demo.ipynb)
+[![Reproduce (hours, A100)](https://img.shields.io/badge/Colab-full_reproduction-555?logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/ranbir/antisd-gemma4/blob/main/antisd_gemma4_colab.ipynb)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.11609-b31b1b.svg)](https://arxiv.org/abs/2605.11609)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -37,15 +38,25 @@ $0.93 H_{\text{warm}}$) switches the term off if the teacher's entropy collapses
 | `train_antisd.py` | GRPO + AntiSD training loop. `--lambda_asd 0` is the GRPO baseline. Writes `metrics.jsonl`, `rollouts.jsonl`, and the adapter. |
 | `eval_antisd.py` | Held-out GSM8K evaluation: pass@1, thought length, deliberation markers, per-example completions. |
 | `inspect_pmi.py` | Samples a trace and colours every token by $u_t$. Terminal output plus a standalone HTML heatmap. |
-| `antisd_gemma4_colab.ipynb` | Drives the three scripts end to end on a Colab GPU. Regenerate with `python make_notebook.py`. |
+| `antisd_gemma4_demo.ipynb` | **Start here.** Loads the published adapters and shows the PMI heatmap and traces on one problem. Minutes on a free T4, no training. |
+| `antisd_gemma4_colab.ipynb` | Full reproduction: base eval, GRPO, AntiSD, adapter evals, figures, publish. Hours on an A100. |
+| `results/<run>/` | Evaluation records and training metrics from the runs in the post, so the tables can be rebuilt without a GPU. |
+| `make_notebook.py` | Generates both notebooks; the notebooks contain no logic of their own. |
 
 ## Quickstart
 
-### Colab (recommended)
+### Five-minute demo (recommended)
 
-Open the notebook badge above and run all cells. Gemma 4 E2B is an ungated Apache 2.0 model, so no
-license click-through or token is needed to download it. A token (Colab secret `HF_TOKEN`) is only
-needed if you want the last cell to upload your adapter to the Hub.
+Open the **demo** badge above and run all cells. It downloads the base model and the trained adapter,
+then renders the per-token PMI heatmap and the before/after traces on a GSM8K problem you pick.
+Gemma 4 E2B is ungated Apache 2.0, so no token is needed.
+
+### Full reproduction
+
+Open the **full reproduction** badge. On an A100 the whole pipeline (base eval, two 100-step training
+runs, two adapter evals, figures) takes about seven hours; a T4 works with 4-bit but is several times
+slower. Rollouts are generated four problems at a time and the adapter is checkpointed every 25 steps.
+A write token in the Colab secret `HF_TOKEN` is only needed for the final publish cell.
 
 ### CLI
 
@@ -75,12 +86,12 @@ Add `--load_in_4bit` to every command on a 16 GB GPU such as a Colab T4.
 | --- | --- | --- |
 | Model | `google/gemma-4-E2B-it` | thinking mode on via the chat template |
 | LoRA | r=16, alpha=32, dropout 0.05 | q/k/v/o projections of the text model only |
-| Steps / rollouts | 50 steps, G=4 | one GSM8K train problem per step, shuffled with the seed |
+| Steps / rollouts | 100 steps, G=4 | one GSM8K train problem per update; rollouts generated 4 problems at a time |
 | Sampling | T=1.0, top-p 0.95, top-k 64 | Gemma 4's recommended settings |
-| Generation budget | 1024 new tokens | thinking + answer |
+| Generation budget | 2048 new tokens | thinking + answer; 1024 leaves a third of traces unfinished |
 | AntiSD weight | lambda = 0.5 | paper default |
 | Gate | 5 warmup steps at lambda=0, tau_down = 0.93 H_warm | paper default |
-| Optimiser | AdamW, lr 1e-5, cosine, grad-clip 1.0 | |
+| Optimiser | AdamW, lr 1e-4, cosine, grad-clip 1.0 | LoRA rate; 1e-5 was too low to move the adapter |
 | Eval | 200 GSM8K test problems, greedy | `--k 4` for avg@4 with sampling |
 
 ## Correctness checks that run on CPU
