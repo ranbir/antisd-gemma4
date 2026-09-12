@@ -79,40 +79,43 @@ if not os.path.exists("antisd-gemma4"):
 """),
     code("""
 # 5. Experiment settings (edit here, nowhere else)
-STEPS = 50          # training steps per run
+RUN = "run2"        # outputs/<RUN>/... so several configurations can coexist
+STEPS = 100         # training steps per run
 GROUP = 4           # rollouts per prompt
 LAMBDA = 0.5        # AntiSD weight (paper default)
-MAX_NEW = 1024      # generation budget for thinking + answer
-N_EVAL = 100        # held-out GSM8K test problems (200 in the blog; lower it for a quick pass)
+LR = 1e-4           # LoRA learning rate (1e-5 in run1 was too low to move the adapter)
+MAX_NEW = 2048      # generation budget for thinking + answer (1024 left ~35% of traces unfinished)
+N_EVAL = 200        # held-out GSM8K test problems (std. error ~3.3 points at 200)
 SEED = 0
 EVAL_BS = 4 if FOURBIT else 16   # problems generated at once during evaluation
+import os; os.makedirs(f"outputs/{RUN}", exist_ok=True)
 """),
     code("""
 # 6. Evaluate the untouched base model
-!python eval_antisd.py --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/eval_base.json
+!python eval_antisd.py --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/{RUN}/eval_base.json
 """),
     code("""
 # 7. GRPO baseline: identical pipeline, AntiSD term switched off
-!python train_antisd.py --lambda_asd 0 --total_steps {STEPS} --group_size {GROUP} \\
-    --max_new_tokens {MAX_NEW} --seed {SEED} {FOURBIT} --output_dir outputs/grpo
+!python train_antisd.py --lambda_asd 0 --total_steps {STEPS} --group_size {GROUP} --lr {LR} \\
+    --max_new_tokens {MAX_NEW} --seed {SEED} {FOURBIT} --output_dir outputs/{RUN}/grpo
 """),
     code("""
 # 8. AntiSD
-!python train_antisd.py --lambda_asd {LAMBDA} --total_steps {STEPS} --group_size {GROUP} \\
-    --max_new_tokens {MAX_NEW} --seed {SEED} {FOURBIT} --output_dir outputs/antisd
+!python train_antisd.py --lambda_asd {LAMBDA} --total_steps {STEPS} --group_size {GROUP} --lr {LR} \\
+    --max_new_tokens {MAX_NEW} --seed {SEED} {FOURBIT} --output_dir outputs/{RUN}/antisd
 """),
     code("""
 # 9. Evaluate both adapters on the same held-out problems
-!python eval_antisd.py --adapter_dir outputs/grpo   --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/eval_grpo.json
-!python eval_antisd.py --adapter_dir outputs/antisd --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/eval_antisd.json
+!python eval_antisd.py --adapter_dir outputs/{RUN}/grpo   --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/{RUN}/eval_grpo.json
+!python eval_antisd.py --adapter_dir outputs/{RUN}/antisd --n {N_EVAL} --max_new_tokens {MAX_NEW} --batch_size {EVAL_BS} {FOURBIT} --out outputs/{RUN}/eval_antisd.json
 """),
     code("""
 # 10. Results table (this is what goes into the blog post)
 import json, pandas as pd
 rows = []
-for name, path in [("Gemma 4 E2B (base)", "outputs/eval_base.json"),
-                   ("+ GRPO, 50 steps", "outputs/eval_grpo.json"),
-                   ("+ AntiSD, 50 steps", "outputs/eval_antisd.json")]:
+for name, path in [("Gemma 4 E2B (base)", f"outputs/{RUN}/eval_base.json"),
+                   (f"+ GRPO, {STEPS} steps", f"outputs/{RUN}/eval_grpo.json"),
+                   (f"+ AntiSD, {STEPS} steps", f"outputs/{RUN}/eval_antisd.json")]:
     s = json.load(open(path))["summary"]
     rows.append({"method": name,
                  "pass@1 (%)": round(100 * s["accuracy"], 1),
@@ -129,31 +132,31 @@ print(df.to_markdown())
 import matplotlib.pyplot as plt
 def load_metrics(path):
     return pd.DataFrame([json.loads(l) for l in open(path)])
-m = {"GRPO": load_metrics("outputs/grpo/metrics.jsonl"), "AntiSD": load_metrics("outputs/antisd/metrics.jsonl")}
+m = {"GRPO": load_metrics(f"outputs/{RUN}/grpo/metrics.jsonl"), "AntiSD": load_metrics(f"outputs/{RUN}/antisd/metrics.jsonl")}
 fig, axes = plt.subplots(2, 2, figsize=(11, 7))
 for name, d in m.items():
     axes[0,0].plot(d.step, d.reward_mean.rolling(5, min_periods=1).mean(), label=name)
     axes[0,1].plot(d.step, d.avg_thought_tokens, label=name)
     axes[1,0].plot(d.step, d.avg_deliberation_markers, label=name)
-    axes[1,1].plot(d.step, d.teacher_entropy_median, label=name)
+    axes[1,1].plot(d.step, d.teacher_entropy_mean, label=name)
 axes[0,0].set_title("train reward (rolling mean of 5)"); axes[0,1].set_title("thought tokens per rollout")
-axes[1,0].set_title("deliberation markers per rollout"); axes[1,1].set_title("median teacher entropy (gate input)")
+axes[1,0].set_title("deliberation markers per rollout"); axes[1,1].set_title("mean teacher entropy (median is ~0)")
 for ax in axes.flat: ax.legend(); ax.set_xlabel("step")
-plt.tight_layout(); os.makedirs("assets", exist_ok=True); plt.savefig("assets/training_curves.png", dpi=150); plt.show()
+plt.tight_layout(); os.makedirs("assets", exist_ok=True); plt.savefig(f"assets/{RUN}_training_curves.png", dpi=150); plt.show()
 """),
     code("""
 # 12. Per-token PMI heatmaps on the same held-out problem, base vs AntiSD
 IDX = 3
-!python inspect_pmi.py --gsm8k_index {IDX} --greedy {FOURBIT} --html_out assets/pmi_base.html --json_out outputs/pmi_base.json
-!python inspect_pmi.py --gsm8k_index {IDX} --greedy {FOURBIT} --adapter_dir outputs/antisd --html_out assets/pmi_antisd.html --json_out outputs/pmi_antisd.json
+!python inspect_pmi.py --gsm8k_index {IDX} --greedy --max_new_tokens {MAX_NEW} {FOURBIT} --html_out assets/{RUN}_pmi_base.html --json_out outputs/{RUN}/pmi_base.json
+!python inspect_pmi.py --gsm8k_index {IDX} --greedy --max_new_tokens {MAX_NEW} {FOURBIT} --adapter_dir outputs/{RUN}/antisd --html_out assets/{RUN}_pmi_antisd.html --json_out outputs/{RUN}/pmi_antisd.json
 from IPython.display import HTML, display
-display(HTML(open("assets/pmi_base.html").read()))
-display(HTML(open("assets/pmi_antisd.html").read()))
+display(HTML(open(f"assets/{RUN}_pmi_base.html").read()))
+display(HTML(open(f"assets/{RUN}_pmi_antisd.html").read()))
 """),
     code("""
 # 13. Before / after traces on one held-out problem (paste real ones into the blog)
-base = json.load(open("outputs/eval_base.json"))["records"]
-anti = json.load(open("outputs/eval_antisd.json"))["records"]
+base = json.load(open(f"outputs/{RUN}/eval_base.json"))["records"]
+anti = json.load(open(f"outputs/{RUN}/eval_antisd.json"))["records"]
 # pick the first problem the base model got wrong and AntiSD got right, else the first problem
 cands = [b["idx"] for b, a in zip(base, anti) if b["correct"] == 0 and a["correct"] == 1]
 i = cands[0] if cands else 0
@@ -164,7 +167,13 @@ print("\\n===== ANTISD (correct=%s) =====\\n" % anti[i]["correct"], anti[i]["com
     code("""
 # 14. (Optional) push the AntiSD adapter to the Hub
 # from huggingface_hub import HfApi
-# HfApi().upload_folder(folder_path="outputs/antisd", repo_id="YOUR_USERNAME/gemma-4-e2b-it-antisd", repo_type="model")
+# HfApi().upload_folder(folder_path=f"outputs/{RUN}/antisd", repo_id="YOUR_USERNAME/gemma-4-e2b-it-antisd", repo_type="model")
+"""),
+    code("""
+# 15. Bundle every result file for this run and download it
+!zip -qr {RUN}_results.zip outputs/{RUN} assets
+from google.colab import files
+files.download(f"{RUN}_results.zip")
 """),
 ]
 
