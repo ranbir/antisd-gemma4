@@ -28,9 +28,13 @@ cells = [
 This notebook reproduces the experiment behind the blog post *Teaching Gemma 4 to Hesitate*.
 It runs three things on `google/gemma-4-E2B-it` with Gemma 4's native thinking mode enabled:
 
-1. **Base model** evaluation on held-out GSM8K.
-2. **GRPO baseline**: 50 steps of on-policy RL with the verifiable reward only (`--lambda_asd 0`).
-3. **AntiSD**: the same 50 steps plus the per-token AntiSD advantage (`--lambda_asd 0.5`).
+1. **Base model** evaluation on 200 held-out GSM8K problems.
+2. **GRPO baseline**: 100 steps of on-policy RL with the verifiable reward only (`--lambda_asd 0`).
+3. **AntiSD**: the same 100 steps plus the per-token AntiSD advantage (`--lambda_asd 0.5`).
+
+All settings live in cell 5. Rollouts are generated four problems at a time, a resumable checkpoint
+is written every 25 steps, and the training cells pass `--resume`, so if the runtime disconnects you
+can simply re-run the interrupted cell and it continues from the last checkpoint.
 
 Then it evaluates both adapters, plots the training curves, and renders per-token PMI heatmaps.
 
@@ -38,7 +42,7 @@ All logic lives in the repo's Python files; this notebook only calls them.
 Reference: Shen et al. (2026), [arXiv:2605.11609](https://arxiv.org/abs/2605.11609).
 
 **Hardware.** A T4 (16 GB) works with `--load_in_4bit`. An L4 or A100 runs in bfloat16 and is much faster.
-Expect the full pipeline (3 evals + 2 trainings) to take several hours on a T4; see the timing printed by each step.
+On an A100 expect roughly three hours end to end; a T4 is several times slower. Each step prints its elapsed time.
 """),
     code("""
 # 1. GPU check
@@ -97,12 +101,12 @@ import os; os.makedirs(f"outputs/{RUN}", exist_ok=True)
     code("""
 # 7. GRPO baseline: identical pipeline, AntiSD term switched off
 !python train_antisd.py --lambda_asd 0 --total_steps {STEPS} --group_size {GROUP} --lr {LR} \\
-    --max_new_tokens {MAX_NEW} --seed {SEED} {FOURBIT} --output_dir outputs/{RUN}/grpo
+    --max_new_tokens {MAX_NEW} --seed {SEED} {FOURBIT} --resume --output_dir outputs/{RUN}/grpo
 """),
     code("""
 # 8. AntiSD
 !python train_antisd.py --lambda_asd {LAMBDA} --total_steps {STEPS} --group_size {GROUP} --lr {LR} \\
-    --max_new_tokens {MAX_NEW} --seed {SEED} {FOURBIT} --output_dir outputs/{RUN}/antisd
+    --max_new_tokens {MAX_NEW} --seed {SEED} {FOURBIT} --resume --output_dir outputs/{RUN}/antisd
 """),
     code("""
 # 9. Evaluate both adapters on the same held-out problems
@@ -166,12 +170,13 @@ print("\\n===== ANTISD (correct=%s) =====\\n" % anti[i]["correct"], anti[i]["com
 """),
     code("""
 # 14. Publish: adapters to the Hub, result files into the repo's results/ folder.
-#     Needs a WRITE token in the HF_TOKEN secret. Set HF_USER to your username.
-HF_USER = "ribnar"
+#     Needs a WRITE token in the HF_TOKEN secret; the username comes from that login.
 PUBLISH = False   # flip to True after checking the table above
 if PUBLISH:
     from huggingface_hub import HfApi
     api = HfApi()
+    HF_USER = api.whoami()["name"]
+    print("publishing as", HF_USER)
     for name in ("grpo", "antisd"):
         repo = f"{HF_USER}/gemma-4-e2b-it-{name}-{RUN}"
         api.create_repo(repo, repo_type="model", exist_ok=True)
@@ -256,7 +261,7 @@ display(pd.DataFrame(rows).set_index("method")) if rows else print("results/ not
     code("""
 # 3. Pick a held-out problem and the adapter to compare against the base model
 IDX = 3                                            # GSM8K test index; try 21 or 28 for problems the base gets wrong
-ADAPTER = "ribnar/gemma-4-e2b-it-antisd-run2"      # Hub id of the AntiSD adapter from the post
+ADAPTER = "ribnar/gemma-4-e2b-it-antisd-run2"      # Hub id of the AntiSD adapter from the post (swap in your own)
 !python inspect_pmi.py --gsm8k_index {IDX} --greedy --max_new_tokens 2048 {FOURBIT} \\
     --html_out demo_base.html --json_out demo_base.json
 !python inspect_pmi.py --gsm8k_index {IDX} --greedy --max_new_tokens 2048 {FOURBIT} --adapter_dir {ADAPTER} \\

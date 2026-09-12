@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import random
+import re
 import statistics
 import time
 from typing import Dict, List, Optional
@@ -106,6 +107,32 @@ class SchmittEntropyGate:
             self.is_open = True
         return {"gate": "open" if self.is_open else "closed", "gate_open": self.is_open}
 
+    def state_dict(self) -> Dict[str, object]:
+        return {k: getattr(self, k) for k in ("warmup_entropies", "h_warm", "tau_down", "is_open", "inert")}
+
+    def load_state_dict(self, d: Dict[str, object]) -> None:
+        for k, v in d.items():
+            setattr(self, k, v)
+
+
+def save_checkpoint(path: str, model, optimizer, scheduler, gate, step: int) -> None:
+    """Adapter weights + optimizer/scheduler/gate state, enough to resume exactly."""
+    os.makedirs(path, exist_ok=True)
+    model.save_pretrained(path)
+    torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                "gate": gate.state_dict(), "step": step, "rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None},
+               os.path.join(path, "trainer_state.pt"))
+
+
+def latest_checkpoint(output_dir: str) -> Optional[str]:
+    cks = []
+    for name in os.listdir(output_dir) if os.path.isdir(output_dir) else []:
+        m = re.fullmatch(r"checkpoint-(\d+)", name)
+        if m and os.path.exists(os.path.join(output_dir, name, "trainer_state.pt")):
+            cks.append((int(m.group(1)), os.path.join(output_dir, name)))
+    return max(cks)[1] if cks else None
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -154,16 +181,39 @@ def train(args) -> None:
     stop_ids = terminator_ids(tokenizer, model)
     problems = load_problems(args)
 
+    start_step = 0
+    ck = latest_checkpoint(args.output_dir) if args.resume else None
+    if ck:
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+        set_peft_model_state_dict(model, load_file(os.path.join(ck, "adapter_model.safetensors")))
+        state = torch.load(os.path.join(ck, "trainer_state.pt"), map_location="cpu", weights_only=False)
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        gate.load_state_dict(state["gate"])
+        torch.set_rng_state(state["rng"])
+        if state.get("cuda_rng") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["cuda_rng"])
+        start_step = int(state["step"])
+        print(f"[resume] restored {ck}; continuing from step {start_step + 1}")
+    elif args.resume:
+        print("[resume] no checkpoint found, starting from step 1")
+
     metrics_path = os.path.join(args.output_dir, "metrics.jsonl")
     rollouts_path = os.path.join(args.output_dir, "rollouts.jsonl")
-    metrics_f = open(metrics_path, "w")
-    rollouts_f = open(rollouts_path, "w")
+    if start_step:  # keep only the lines up to the checkpoint, then append
+        for path in (metrics_path, rollouts_path):
+            if os.path.exists(path):
+                kept = [l for l in open(path) if json.loads(l)["step"] <= start_step]
+                open(path, "w").writelines(kept)
+    metrics_f = open(metrics_path, "a" if start_step else "w")
+    rollouts_f = open(rollouts_path, "a" if start_step else "w")
 
     print(f"Training {args.total_steps} steps, G={args.group_size}, B={args.problems_per_batch} problems/generate, "
           f"lambda={args.lambda_asd}, warmup={args.warmup_steps}, max_new_tokens={args.max_new_tokens}")
     t_start = time.time()
     buffer: List[tuple] = []  # (problem, gold, prompt_ids, gens) awaiting an update
-    for step in range(args.total_steps):
+    for step in range(start_step, args.total_steps):
         # ---- 1. sample G rollouts per problem, B problems per generate() call ---------
         # Decoding is memory-bound, so B prompts cost little more than one. Updates
         # still happen one problem at a time; problems 2..B in a batch are trained on
@@ -264,9 +314,9 @@ def train(args) -> None:
         rollouts_f.flush()
 
         if args.save_every and (step + 1) % args.save_every == 0 and step + 1 < args.total_steps:
-            ck = os.path.join(args.output_dir, f"checkpoint-{step+1}")
-            model.save_pretrained(ck)
-            print(f"[checkpoint] saved {ck}")
+            ck_path = os.path.join(args.output_dir, f"checkpoint-{step+1}")
+            save_checkpoint(ck_path, model, optimizer, scheduler, gate, step + 1)
+            print(f"[checkpoint] saved {ck_path}")
 
         if (step + 1) % args.log_every == 0 or step == 0:
             print(f"[step {step+1:3d}/{args.total_steps}] loss={total_loss:+.4f} "
@@ -298,7 +348,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--group_size", type=int, default=4, help="rollouts per prompt, G")
     p.add_argument("--problems_per_batch", type=int, default=4,
                    help="problems sampled per generate() call; updates stay one problem per step (1 = fully on-policy)")
-    p.add_argument("--save_every", type=int, default=25, help="save an adapter checkpoint every N steps (0 = off)")
+    p.add_argument("--save_every", type=int, default=25, help="save a resumable checkpoint every N steps (0 = off)")
+    p.add_argument("--resume", action="store_true", help="continue from the latest checkpoint-N in --output_dir, if any")
     p.add_argument("--lambda_asd", type=float, default=0.5, help="AntiSD mixing weight (paper: 0.5; 0 = GRPO baseline)")
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--lr_warmup_steps", type=int, default=2)
